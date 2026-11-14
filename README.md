@@ -33,6 +33,20 @@ Pre-configured quests:
 - Uninvited Guests
 - Spice Gals
 - Requiem of Sin
+- Waking the Beast
+
+#### Waking the Beast
+
+Repeatable once per Conquest tally, and tracked from its key items alone: only the first run ever shows in the quest log (repeats keep the quest marked complete on the server), so log 4 / quest 32 is only a hint for that first week.
+
+| Status | What it means |
+|---|---|
+| NOT STARTED | No Rainbow Resonator. Talk to the `???` in La Theine Plateau (G-6) |
+| NEED TO COMPLETE | Holding the Rainbow Resonator. The row counts the Eyes won from the six Prime avatars, e.g. `Eyes 3/6 - need Gales, Frost, Storms`, and reads `Eyes 6/6 - Full Moon Fountain` once all six are in hand |
+| READY TO TURN IN | Holding the Faded Ruby from the Full Moon Fountain win (the Eyes and the Resonator are consumed there). Return it to the `???` |
+| COMPLETED | The `???` took the Faded Ruby this week |
+
+The Eye count is read live for the current character and stored for the other characters' tabs. Losing the Resonator without a Faded Ruby to show for it - a failed battlefield on a server that takes the key items - puts the quest back to NOT STARTED after a few seconds' grace (the server drops one key item and grants the other in separate packets), since it has to be re-flagged at the `???`.
 
 ### Cooldowns (ENM / Limbus / HAAP / Assault / ISNM)
 
@@ -156,7 +170,7 @@ The starting value cannot be read from the game, so the row shows `Unknown - set
 
 The addon uses multiple detection methods depending on the quest type:
 
-- **Packet 0x055 (Key Items)** - Monitors the key item bitmap to detect when quest-related KIs are obtained or removed. KI removal is used to detect quest completion or objective completion.
+- **Packet 0x055 (Key Items)** - Monitors the key item bitmap to detect when quest-related KIs are obtained or removed. KI removal is used to detect quest completion or objective completion. Progress KIs (the Eyes for Waking the Beast) are counted from the same bitmap.
 - **Packet 0x056 (Quest Log)** - Reads the active quest bitmap to determine if a quest is currently flagged, and the completed Aht Urhgan block (port 0x00C0), whose words 4-7 list every completed Assault mission, to tell a first clear from a repeat.
 - **Packet 0x00A (Zone-In)** - Detects Dynamis zone-ins, and leaving The Ashu Talif after a run.
 - **Packet 0x034 (NPC Event)** - Reads the Assault tag stock and restock timer from Rytaal's event parameters, and the currently registered assault from the reception counters' events. Matched on event id (268 for Rytaal, 273-277 for the counters) in Aht Urhgan Whitegate rather than on NPC ids, which are not guaranteed to be identical across servers.
@@ -200,6 +214,16 @@ Edit the `QUESTS` table near the top of `weeklier.lua`. Each quest entry support
     ki_quest_active     = 'KEY_ITEM_NAME',        -- KI received on quest accept
     ki_active_is_completion = false,              -- If true, KI removal = COMPLETED (no turn-in)
     ki_quest_incomplete = 'KEY_ITEM_NAME',        -- KI held until turn-in
+    ki_active_lost_resets = false,                -- If true, losing ki_quest_active only counts as the
+                                                  -- objective being done when ki_quest_incomplete is (or
+                                                  -- within seconds becomes) held; otherwise -> NOT STARTED
+
+    -- Progress key items collected along the way (optional)
+    ki_progress         = {                       -- Shown as "<progress_label> n/N" beside the status,
+        { ki = 'KEY_ITEM_NAME', label = 'Short' },  -- with the labels still missing
+    },
+    progress_label      = 'Eyes',                 -- Word for the count
+    progress_done_hint  = 'Full Moon Fountain',   -- Shown once every ki_progress KI is held
 
     -- Chat-based detection (fallback for bugged quests)
     flag_phrase         = 'npc dialogue text',    -- Chat text when quest is flagged (string or table of strings)
@@ -217,7 +241,7 @@ The Config tab provides a manual status override for any quest, ENM / Limbus / I
 
 ## Data Storage
 
-All data is saved to `char_data.json` in the addon directory. This includes per-character quest status, ENM / Limbus / ISNM cooldown timers, Eco Warrior rotation history, Dynamis entry logs, Assault rank and rank-up points, the account-wide Assault tag stock and Ashu Talif week, and UI preferences (hidden quests).
+All data is saved to `char_data.json` in the addon directory. This includes per-character quest status, progress key items held (the Waking the Beast Eyes), ENM / Limbus / ISNM cooldown timers, Eco Warrior rotation history, Dynamis entry logs, Assault rank and rank-up points, the account-wide Assault tag stock and Ashu Talif week, and UI preferences (hidden quests).
 
 ## Dependencies
 

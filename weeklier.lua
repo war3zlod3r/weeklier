@@ -51,6 +51,24 @@ end
 --                         Having this KI = ready to turn in (READY TO TURN IN).
 --                         KI removal is detected via 0x055 packet updates and triggers
 --                         COMPLETED status (the KI is consumed on turn-in).
+--   ki_active_lost_resets : boolean. Normally losing ki_quest_active means the
+--                         objective is done (READY TO TURN IN). With this set it
+--                         only means that if ki_quest_incomplete is in hand, or
+--                         arrives within KI_LOSS_GRACE seconds (the server drops
+--                         one KI and grants the other in separate 0x055 packets);
+--                         losing it with nothing to show sends the quest back to
+--                         NOT STARTED. For quests whose active KI is the only
+--                         sign they are underway and can be lost, e.g. on a
+--                         failed battlefield.
+--   ki_progress         : optional list of { ki = 'KEY_ITEM_NAME', label = 'Short' }
+--                         collected on the way to the objective (the six Eyes of
+--                         Waking the Beast). Shown next to the status as
+--                         "<progress_label> n/N" with the labels still missing;
+--                         read live from the bitmap for the current character
+--                         and stored per character for the other tabs.
+--   progress_label      : word for the ki_progress count, e.g. 'Eyes'.
+--   progress_done_hint  : text shown once every ki_progress KI is held, e.g.
+--                         where to take them ('Full Moon Fountain').
 --
 -- Status derivation for non-ENM quests (current character only):
 --   COMPLETED        : ki_quest_incomplete KI removed (turn-in), OR
@@ -190,6 +208,34 @@ local QUESTS = {
         name                    = 'Requiem of Sin',
         ki_quest_active         = 'LETTER_FROM_THE_MITHRAN_TRACKERS',
         ki_active_is_completion = true,
+    },
+    -- -----------------------------------------------------------------------
+    -- Waking the Beast: the ??? at La Theine Plateau (G-6) hands out the
+    -- Rainbow Resonator; each Prime avatar beaten in its cloister grants that
+    -- element's Eye; the Full Moon Fountain win takes the six Eyes and the
+    -- Resonator and leaves the Faded Ruby, which the ??? takes back on
+    -- turn-in (Carbuncle's Pole). Repeatable after the Conquest tally. Only
+    -- the first run sets the quest-log bit - repeats keep the quest marked
+    -- complete server-side - so the key items carry the status. Log 4 (Other
+    -- Areas), quest 32.
+    -- -----------------------------------------------------------------------
+    {
+        name                  = 'Waking the Beast',
+        quest_log_id          = 4,
+        quest_id              = 32,
+        ki_quest_active       = 'RAINBOW_RESONATOR',
+        ki_quest_incomplete   = 'FADED_RUBY',
+        ki_active_lost_resets = true,
+        progress_label        = 'Eyes',
+        progress_done_hint    = 'Full Moon Fountain',
+        ki_progress           = {
+            { ki = 'EYE_OF_FLAMES',  label = 'Flames'  },   -- Ifrit Prime
+            { ki = 'EYE_OF_TREMORS', label = 'Tremors' },   -- Titan Prime
+            { ki = 'EYE_OF_TIDES',   label = 'Tides'   },   -- Leviathan Prime
+            { ki = 'EYE_OF_GALES',   label = 'Gales'   },   -- Garuda Prime
+            { ki = 'EYE_OF_FROST',   label = 'Frost'   },   -- Shiva Prime
+            { ki = 'EYE_OF_STORMS',  label = 'Storms'  },   -- Ramuh Prime
+        },
     },
     -- -----------------------------------------------------------------------
     -- The Cooldowns table draws its rows in this order, so the daily ToAU
@@ -918,6 +964,13 @@ local function had_key_item(ki_id)
     return bit.band(dword, bit.lshift(1, bit_offset)) ~= 0
 end
 
+-- Whether the 0x055 table holding a key item has been received yet. Until it
+-- has, has_key_item() says "no" for everything in it, which must not be read
+-- as the key item being gone.
+local function ki_table_loaded(ki_id)
+    return ki_bitmap[math.floor(ki_id / 512)] ~= nil
+end
+
 -- Resolve a quest's key_item config string to a numeric ID (cached per quest).
 local ki_id_cache = {}
 local function resolve_ki_id(ki_name)
@@ -927,6 +980,12 @@ local function resolve_ki_id(ki_name)
     local id = ki_name_to_id[upper]
     ki_id_cache[upper] = id or false
     return id or nil
+end
+
+-- has_key_item() by config name; false for an unknown or empty name.
+local function has_key_item_named(ki_name)
+    local ki_id = resolve_ki_id(ki_name)
+    return ki_id ~= nil and has_key_item(ki_id)
 end
 
 local function is_bit_set_in_block(block, bit_index)
@@ -1200,6 +1259,11 @@ local function ensure_char(name)
         data[name].enms = {}
     end
 
+    -- Ensure progress table exists (ki_progress key items held, per quest)
+    if not data[name].progress then
+        data[name].progress = {}
+    end
+
     -- Week rollover - only reset COMPLETED quests (flagged/in-progress quests
     -- persist across the weekly boundary in-game and don't need to be re-flagged)
     local week_rolled_over = false
@@ -1455,6 +1519,14 @@ local function queue_or_confirm_kill(qi, q)
     end
 end
 
+-- ki_active_lost_resets quests whose ki_quest_active went away without
+-- ki_quest_incomplete in hand: { [quest_name] = os.clock() of the loss }.
+-- The server removes the one before it grants the other, each in its own
+-- 0x055 packet, so the loss gets KI_LOSS_GRACE seconds to turn into a
+-- turn-in before derive_quest_status treats it as the quest being abandoned.
+local KI_LOSS_GRACE = 10.0
+local ki_active_lost_at = {}
+
 -- ============================================================================
 -- Packet-Based Status Derivation (non-ENM, non-kill_mob quests)
 -- ============================================================================
@@ -1523,6 +1595,21 @@ local function derive_quest_status(q, stored_status)
         else
             -- Quest is not active and no KIs present - use stored status
             result = stored_status or 'NOT STARTED'
+
+            -- ki_active_lost_resets: the active KI is the only sign the quest
+            -- is underway, so once the bitmap can be read and says it is gone
+            -- - and the loss has had KI_LOSS_GRACE seconds to turn into the
+            -- turn-in KI - the quest was abandoned and is back to NOT STARTED.
+            if q.ki_active_lost_resets and result == 'NEED TO COMPLETE' then
+                local ki_a = resolve_ki_id(q.ki_quest_active)
+                local ki_i = resolve_ki_id(q.ki_quest_incomplete)
+                if ki_a and ki_table_loaded(ki_a) and (not ki_i or ki_table_loaded(ki_i)) then
+                    local lost_at = ki_active_lost_at[q.name]
+                    if not lost_at or (os.clock() - lost_at) > KI_LOSS_GRACE then
+                        result = 'NOT STARTED'
+                    end
+                end
+            end
         end
 
         -- Debug: only log when the derived result changes from last time
@@ -1547,8 +1634,63 @@ local function derive_quest_status(q, stored_status)
         end
     end
 
+    -- A pending loss is settled either way once the quest is no longer underway.
+    if result ~= 'NEED TO COMPLETE' then
+        ki_active_lost_at[q.name] = nil
+    end
+
     last_derived_status[q.name] = result
     return result
+end
+
+-- ============================================================================
+-- Progress key items (ki_progress)
+-- ============================================================================
+-- The set of a quest's ki_progress key items a character holds, as
+-- { [ki_name] = true }, and how many that is. Read live from the bitmap for
+-- the current character once the tables holding them have arrived; the
+-- stored copy (cd.progress[quest]) otherwise, which is also what the other
+-- characters' tabs show.
+local function get_quest_progress(q, cd, is_current)
+    local held = (cd and cd.progress and cd.progress[q.name]) or {}
+    if is_current then
+        local live = {}
+        local readable = true
+        for _, p in ipairs(q.ki_progress) do
+            local ki_id = resolve_ki_id(p.ki)
+            if not ki_id or not ki_table_loaded(ki_id) then
+                readable = false
+                break
+            end
+            if has_key_item(ki_id) then live[p.ki] = true end
+        end
+        if readable then held = live end
+    end
+    local count = 0
+    for _, p in ipairs(q.ki_progress) do
+        if held[p.ki] then count = count + 1 end
+    end
+    return held, count
+end
+
+-- Store the current character's live reading when it differs from the saved
+-- one. A gain is logged (unless quiet); a loss is the battlefield consuming
+-- the lot, or a failure, which the status change already reports.
+local function persist_quest_progress(q, cd, quiet)
+    local held, count = get_quest_progress(q, cd, true)
+    if not cd.progress then cd.progress = {} end
+    local stored = cd.progress[q.name] or {}
+    local changed = false
+    local stored_count = 0
+    for _, p in ipairs(q.ki_progress) do
+        if stored[p.ki] then stored_count = stored_count + 1 end
+        if (held[p.ki] or false) ~= (stored[p.ki] or false) then changed = true end
+    end
+    if not changed then return end
+    cd.progress[q.name] = held
+    local line = string.format('%s: %s %d/%d', q.name, q.progress_label or 'Progress', count, #q.ki_progress)
+    if count > stored_count and not quiet then log(line) else dlog(line) end
+    save_data()
 end
 
 -- ============================================================================
@@ -1601,6 +1743,14 @@ local function process_ki_removals(table_index)
                             log(string.format('KI removed: %s - marking %s as COMPLETED.',
                                 q.ki_quest_active, q.name))
                             try_advance(name, q.name, 'COMPLETED')
+                        elseif q.ki_active_lost_resets and not has_key_item_named(q.ki_quest_incomplete) then
+                            -- Nothing to show for it yet. Note when, so
+                            -- derive_quest_status gives the turn-in KI
+                            -- KI_LOSS_GRACE seconds to arrive before calling
+                            -- the quest abandoned.
+                            ki_active_lost_at[q.name] = os.clock()
+                            dlog(string.format('KI removed: %s without %s - %s goes back to NOT STARTED unless it arrives within %ds.',
+                                q.ki_quest_active, tostring(q.ki_quest_incomplete), q.name, KI_LOSS_GRACE))
                         else
                             log(string.format('KI removed: %s - marking %s as READY TO TURN IN.',
                                 q.ki_quest_active, q.name))
@@ -1671,6 +1821,33 @@ local KI_COLOR_YES = { 0.0, 1.0, 0.4, 1.0 }        -- green
 local KI_COLOR_NO  = { 1.0, 0.3, 0.3, 1.0 }        -- red
 local KI_COLOR_DIM = { 0.5, 0.5, 0.5, 1.0 }        -- grey
 
+
+-- What to show beside a ki_progress quest's status: "Eyes 3/6" and what is
+-- still missing, or the progress_done_hint once everything is in hand, as a
+-- list of { text, color } segments. nil when there is nothing worth showing
+-- (not started with nothing in hand, or past the point where they matter).
+local function describe_quest_progress(q, held, count, status)
+    local total = #q.ki_progress
+    if status == 'COMPLETED' or (count == 0 and status ~= 'NEED TO COMPLETE') then
+        return nil
+    end
+    local count_text = string.format('%s %d/%d', q.progress_label or 'Progress', count, total)
+    if count >= total then
+        if q.progress_done_hint then
+            count_text = count_text .. ' - ' .. q.progress_done_hint
+        end
+        return { { count_text, KI_COLOR_YES } }
+    end
+    local segments = { { count_text, STATUS_COLORS['NEED TO COMPLETE'] } }
+    if count > 0 then
+        local missing = {}
+        for _, p in ipairs(q.ki_progress) do
+            if not held[p.ki] then missing[#missing + 1] = p.label or p.ki end
+        end
+        segments[#segments + 1] = { '- need ' .. table.concat(missing, ', '), KI_COLOR_DIM }
+    end
+    return segments
+end
 
 -- Format a unix timestamp as a short date/time string
 local function format_time(ts)
@@ -1805,6 +1982,9 @@ local function update_current_char_statuses()
                 log(string.format('%s: %s -> %s', q.name, stored_status, status))
                 cd.quests[q.name] = status
                 save_data()
+            end
+            if q.ki_progress then
+                persist_quest_progress(q, cd)
             end
         end
     end
@@ -2422,6 +2602,9 @@ local function render_ui()
                                         cd.quests[q.name] = status
                                         save_data()
                                     end
+                                    if q.ki_progress then
+                                        persist_quest_progress(q, cd, true)
+                                    end
                                 else
                                     status = stored_status
                                 end
@@ -2440,6 +2623,20 @@ local function render_ui()
                                 imgui.Text(q.name)
                                 imgui.NextColumn()
                                 imgui.TextColored(color, status)
+                                -- Progress key items, on the same line: the
+                                -- legacy Columns API does not sync row heights
+                                -- across columns, so a second line here would
+                                -- misalign every row below.
+                                if q.ki_progress then
+                                    local held, count = get_quest_progress(q, cd, is_current_tab)
+                                    local segments = describe_quest_progress(q, held, count, status)
+                                    if segments then
+                                        for _, seg in ipairs(segments) do
+                                            imgui.SameLine()
+                                            imgui.TextColored(seg[2], seg[1])
+                                        end
+                                    end
+                                end
                                 imgui.NextColumn()
                             end
 
@@ -3488,6 +3685,7 @@ ashita.events.register('command', 'weeklier_command_cb', function(e)
                     end
                 end
                 cd.dynamis = {}
+                cd.progress = {}
                 save_data()
                 log('Reset all quests and dynamis for ' .. name)
             end
@@ -3514,7 +3712,17 @@ ashita.events.register('command', 'weeklier_command_cb', function(e)
             if cd then
                 log('Quest status for ' .. name .. ' (' .. cd.week .. '):')
                 for _, q in ipairs(QUESTS) do
-                    log(string.format('  %s: %s', q.name, cd.quests[q.name] or 'NOT STARTED'))
+                    local line = string.format('  %s: %s', q.name, cd.quests[q.name] or 'NOT STARTED')
+                    if q.ki_progress then
+                        local held, count = get_quest_progress(q, cd, true)
+                        local segments = describe_quest_progress(q, held, count, cd.quests[q.name])
+                        if segments then
+                            local parts = {}
+                            for _, seg in ipairs(segments) do parts[#parts + 1] = seg[1] end
+                            line = line .. ' (' .. table.concat(parts, ' ') .. ')'
+                        end
+                    end
+                    log(line)
                 end
                 -- Eco warriors
                 local eco_statuses = derive_eco_statuses(cd, true)
@@ -3613,6 +3821,15 @@ ashita.events.register('command', 'weeklier_command_cb', function(e)
                     q.name, stored, tostring(qa),
                     tostring(q.ki_quest_active), tostring(ki_a_id), tostring(has_a),
                     tostring(q.ki_quest_incomplete), tostring(ki_i_id), tostring(has_i)))
+                if q.ki_progress then
+                    local parts = {}
+                    for _, p in ipairs(q.ki_progress) do
+                        local pid = resolve_ki_id(p.ki)
+                        parts[#parts + 1] = string.format('%s(id=%s,has=%s)', p.ki, tostring(pid),
+                            tostring(pid and has_key_item(pid) or false))
+                    end
+                    log('    progress: ' .. table.concat(parts, ' '))
+                end
             end
         end
 
